@@ -1,0 +1,7 @@
+{
+  "id": "paseo-codegraph-worktree",
+  "description": "Clone the CodeGraph index into new worktrees and keep it indexed, with per-workspace status.",
+  "requirements": {
+    "paseo": ">=0.10.0"
+  }
+}
