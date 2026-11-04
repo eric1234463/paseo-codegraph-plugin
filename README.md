@@ -20,6 +20,11 @@ On `workspace.created`, the server hook brings the workspace index to `ready`:
 2. **No source db** → full `codegraph index` in the worktree.
 3. **Existing index** → `codegraph sync` verify + repair only, never overwritten.
 
+The server resolves the `codegraph` binary to an absolute path (newest nvm
+version first, then `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`;
+`CODEGRAPH_BIN` overrides everything), because Paseo is Finder-launched with
+a minimal `PATH` where a bare `codegraph` fails with ENOENT.
+
 The sidebar surface ("Worktree index", Database icon) lists per-workspace state
 (`pending → cloning → syncing → ready`, or `indexing` / `error` / `skipped`),
 file counts, and a Retry button. It polls `worktree-index.list` every 5s.

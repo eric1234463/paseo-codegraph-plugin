@@ -15,6 +15,10 @@ const {
   cloneIndex,
   resolveWorktreeLayout,
   ensureWorktreeIndex,
+  findCodegraphBin,
+  resolveCodegraphBin,
+  pathEnvWith,
+  _resetCodegraphBinCache,
 } = require("../.test-build/server/worktree-index.js");
 
 test("parseWorktreeList extracts worktree roots in order", () => {
@@ -140,7 +144,7 @@ test("ensureWorktreeIndex syncs an existing index without cloning", async () => 
     await writeFile(destDb, Buffer.alloc(2048));
     const updates = [];
     await ensureWorktreeIndex({ id: "main-ws", cwd: directory, name: null },
-      { run: gitRun, onUpdate: (update) => updates.push(update) });
+      { run: gitRun, codegraphBin: "codegraph", onUpdate: (update) => updates.push(update) });
     assert.equal(updates.at(-1).state, "ready");
     assert.equal(updates.at(-1).fileCount, 42);
     assert.ok(calls.some((call) => call.includes("sync")), `expected a sync call, got: ${calls}`);
@@ -148,6 +152,39 @@ test("ensureWorktreeIndex syncs an existing index without cloning", async () => 
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("findCodegraphBin picks the first existing candidate", () => {
+  assert.equal(findCodegraphBin(["/nope/cg", "/yes/cg"], (path) => path === "/yes/cg"), "/yes/cg");
+  assert.equal(findCodegraphBin(["", "/nope/cg"], () => false), "codegraph");
+  assert.equal(findCodegraphBin([], () => true), "codegraph");
+});
+
+test("resolveCodegraphBin honors CODEGRAPH_BIN and falls back to PATH", () => {
+  const previous = process.env.CODEGRAPH_BIN;
+  try {
+    _resetCodegraphBinCache();
+    process.env.CODEGRAPH_BIN = "  /custom/cg  ";
+    assert.equal(resolveCodegraphBin(() => true), "/custom/cg");
+    _resetCodegraphBinCache();
+    delete process.env.CODEGRAPH_BIN;
+    assert.equal(resolveCodegraphBin(() => false), "codegraph");
+    _resetCodegraphBinCache();
+    const picked = resolveCodegraphBin((path) => path.endsWith("bin/codegraph"));
+    assert.ok(picked.endsWith("bin/codegraph"), `expected a candidate path, got: ${picked}`);
+  } finally {
+    if (previous === undefined) delete process.env.CODEGRAPH_BIN;
+    else process.env.CODEGRAPH_BIN = previous;
+    _resetCodegraphBinCache();
+  }
+});
+
+test("pathEnvWith prepends the binary dir to PATH", () => {
+  assert.equal(pathEnvWith("codegraph"), undefined);
+  const env = pathEnvWith("/x/bin/codegraph", { PATH: "/usr/bin:/bin", OTHER: "keep" });
+  assert.equal(env.PATH, "/x/bin:/usr/bin:/bin");
+  assert.equal(env.OTHER, "keep");
+  assert.equal(pathEnvWith("/x/bin/codegraph", {}).PATH, "/x/bin");
 });
 
 test("ensureWorktreeIndex full-indexes a linked worktree with no source db", async () => {
@@ -164,10 +201,18 @@ test("ensureWorktreeIndex full-indexes a linked worktree with no source db", asy
       return { stdout: JSON.stringify({ initialized: true, fileCount: 7 }), stderr: "" };
     };
     const updates = [];
+    const seenEnvs = [];
+    const capturingRun = async (command, args, options) => {
+      if (command !== "git") seenEnvs.push(options.env);
+      return run(command, args, options);
+    };
     await ensureWorktreeIndex({ id: "linked-ws", cwd: linked, name: null },
-      { run, onUpdate: (update) => updates.push(update) });
+      { run: capturingRun, codegraphBin: "/x/bin/codegraph", onUpdate: (update) => updates.push(update) });
     assert.equal(updates.at(-1).state, "ready");
-    assert.ok(calls.some((call) => call.startsWith("codegraph index")), `expected a full index, got: ${calls}`);
+    assert.ok(calls.some((call) => call === "/x/bin/codegraph init -y " + linked), `expected a full init, got: ${calls}`);
+    assert.ok(seenEnvs.length > 0, "expected codegraph spawns to carry env");
+    assert.ok(seenEnvs.every((env) => env && env.PATH.split(":")[0] === "/x/bin"),
+      `expected bin dir first on PATH, got: ${JSON.stringify(seenEnvs.map((env) => env && env.PATH))}`);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

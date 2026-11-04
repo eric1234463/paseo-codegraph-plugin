@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
+import { existsSync, readdirSync } from "node:fs";
 import { mkdir, realpath, rename, rm, stat } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { access } from "node:fs/promises";
@@ -16,13 +17,14 @@ export interface RunResult {
 export type RunFn = (
   command: string,
   args: readonly string[],
-  options: { timeoutMs: number; maxBufferBytes: number },
+  options: { timeoutMs: number; maxBufferBytes: number; env?: NodeJS.ProcessEnv },
 ) => Promise<RunResult>;
 
-export const defaultRun: RunFn = async (command, args, { timeoutMs, maxBufferBytes }) => {
+export const defaultRun: RunFn = async (command, args, { timeoutMs, maxBufferBytes, env }) => {
   const { stdout, stderr } = await runFile(command, [...args], {
     timeout: timeoutMs,
     maxBuffer: maxBufferBytes,
+    ...(env ? { env } : {}),
   });
   return { stdout: String(stdout), stderr: String(stderr) };
 };
@@ -72,6 +74,68 @@ export function codegraphDbPath(root: string): string {
 
 export function isValidWorkspaceId(id: string): boolean {
   return /^[a-zA-Z0-9_-][a-zA-Z0-9_.-]{0,199}$/.test(id);
+}
+
+let cachedCodegraphBin: string | null = null;
+
+/** Pure: return the first candidate that exists, else fall back to PATH lookup. */
+export function findCodegraphBin(candidates: readonly string[], exists: (path: string) => boolean): string {
+  for (const candidate of candidates) {
+    if (candidate && exists(candidate)) return candidate;
+  }
+  return "codegraph";
+}
+
+/** Likely install locations: newest nvm version first, then system paths. */
+export function codegraphBinCandidates(): string[] {
+  const home = process.env.HOME ?? "";
+  const candidates: string[] = [];
+  try {
+    if (home) {
+      const nvmDir = join(home, ".nvm", "versions", "node");
+      for (const version of readdirSync(nvmDir).sort().reverse()) {
+        candidates.push(join(nvmDir, version, "bin", "codegraph"));
+      }
+    }
+  } catch {
+    // No nvm directory; fall through to system locations.
+  }
+  if (home) candidates.push(join(home, ".local", "bin", "codegraph"));
+  candidates.push("/opt/homebrew/bin/codegraph", "/usr/local/bin/codegraph");
+  return candidates;
+}
+
+/**
+ * Resolve the codegraph binary to an absolute path when possible. Paseo is
+ * Finder-launched with a minimal PATH (no nvm shims), so a bare `codegraph`
+ * fails with ENOENT there. CODEGRAPH_BIN overrides everything.
+ */
+export function resolveCodegraphBin(exists: (path: string) => boolean = existsSync): string {
+  if (cachedCodegraphBin) return cachedCodegraphBin;
+  const override = (process.env.CODEGRAPH_BIN ?? "").trim();
+  if (override) {
+    cachedCodegraphBin = override;
+  } else {
+    cachedCodegraphBin = findCodegraphBin(codegraphBinCandidates(), exists);
+  }
+  return cachedCodegraphBin;
+}
+
+/**
+ * Pure: a copy of base env with the binary's directory prepended to PATH.
+ * codegraph is a `#!/usr/bin/env node` launcher, so under Paseo's minimal
+ * PATH the kernel cannot even resolve `node` for it. Undefined for bare
+ * command names (nothing to prepend).
+ */
+export function pathEnvWith(binary: string, base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv | undefined {
+  if (!binary.includes("/")) return undefined;
+  const dir = dirname(binary);
+  return { ...base, PATH: base.PATH ? `${dir}${delimiter}${base.PATH}` : dir };
+}
+
+/** Test-only: clear the resolver cache. */
+export function _resetCodegraphBinCache(): void {
+  cachedCodegraphBin = null;
 }
 
 function tail(text: string, maxChars = 500): string {
@@ -147,6 +211,8 @@ export async function cloneIndex(sourceDb: string, destDb: string, run: RunFn = 
 
 export interface EnsureDeps {
   run?: RunFn;
+  /** Absolute codegraph binary; defaults to resolveCodegraphBin(). Test seam. */
+  codegraphBin?: string;
   onUpdate: (update: StatusUpdate) => void;
   signal?: AbortSignal;
 }
@@ -162,6 +228,9 @@ function update(deps: EnsureDeps, ref: WorkspaceRef, state: WorktreeIndexState, 
  */
 export async function ensureWorktreeIndex(ref: WorkspaceRef, deps: EnsureDeps): Promise<void> {
   const run = deps.run ?? defaultRun;
+  const codegraph = deps.codegraphBin ?? resolveCodegraphBin();
+  const codegraphEnv = pathEnvWith(codegraph);
+  const runCg: RunFn = (command, args, options) => run(command, args, { ...options, env: codegraphEnv });
   if (!isValidWorkspaceId(ref.id)) return;
   if (deps.signal?.aborted) return;
   if (!(await exists(ref.cwd))) {
@@ -181,7 +250,7 @@ export async function ensureWorktreeIndex(ref: WorkspaceRef, deps: EnsureDeps): 
 
   const checkStatus = async (cwd: string): Promise<CodegraphStatusJson | null> => {
     try {
-      const { stdout } = await run("codegraph", ["status", "-j", cwd],
+      const { stdout } = await runCg(codegraph, ["status", "-j", cwd],
         { timeoutMs: 60_000, maxBufferBytes: 1_000_000 });
       return JSON.parse(stdout) as CodegraphStatusJson;
     } catch {
@@ -194,7 +263,7 @@ export async function ensureWorktreeIndex(ref: WorkspaceRef, deps: EnsureDeps): 
     if (status?.initialized) {
       update(deps, ref, "syncing", "Verifying existing index…", status.fileCount ?? null);
       try {
-        await run("codegraph", ["sync", "-q", ref.cwd], { timeoutMs: 30 * 60_000, maxBufferBytes: 10_000_000 });
+        await runCg(codegraph, ["sync", "-q", ref.cwd], { timeoutMs: 30 * 60_000, maxBufferBytes: 10_000_000 });
       } catch (error) {
         update(deps, ref, "error", `Sync failed: ${tail(errorMessage(error))}`);
         return;
@@ -216,23 +285,23 @@ export async function ensureWorktreeIndex(ref: WorkspaceRef, deps: EnsureDeps): 
       update(deps, ref, "error", `Clone failed: ${tail(errorMessage(error))}`);
       return;
     }
-  } else if (!layout.isLinked) {
-    update(deps, ref, "indexing", "No source index; building from scratch…");
+  } else if (layout.isLinked) {
+    update(deps, ref, "indexing", "Source checkout has no index; building from scratch…");
     try {
-      await run("codegraph", ["index", ref.cwd], { timeoutMs: 30 * 60_000, maxBufferBytes: 10_000_000 });
+      await runCg(codegraph, ["init", "-y", ref.cwd], { timeoutMs: 30 * 60_000, maxBufferBytes: 10_000_000 });
     } catch (error) {
-      update(deps, ref, "error", `Index failed: ${tail(errorMessage(error))}`);
+      update(deps, ref, "error", `Init failed: ${tail(errorMessage(error))}`);
       return;
     }
     const after = await checkStatus(ref.cwd);
     update(deps, ref, "ready", null, after?.fileCount ?? null);
     return;
   } else {
-    update(deps, ref, "indexing", "Source checkout has no index; building from scratch…");
+    update(deps, ref, "indexing", "No source index; building from scratch…");
     try {
-      await run("codegraph", ["index", ref.cwd], { timeoutMs: 30 * 60_000, maxBufferBytes: 10_000_000 });
+      await runCg(codegraph, ["init", "-y", ref.cwd], { timeoutMs: 30 * 60_000, maxBufferBytes: 10_000_000 });
     } catch (error) {
-      update(deps, ref, "error", `Index failed: ${tail(errorMessage(error))}`);
+      update(deps, ref, "error", `Init failed: ${tail(errorMessage(error))}`);
       return;
     }
     const after = await checkStatus(ref.cwd);
@@ -242,7 +311,7 @@ export async function ensureWorktreeIndex(ref: WorkspaceRef, deps: EnsureDeps): 
 
   update(deps, ref, "syncing", "Syncing cloned index to this worktree…");
   try {
-    await run("codegraph", ["sync", "-q", ref.cwd], { timeoutMs: 30 * 60_000, maxBufferBytes: 10_000_000 });
+    await runCg(codegraph, ["sync", "-q", ref.cwd], { timeoutMs: 30 * 60_000, maxBufferBytes: 10_000_000 });
   } catch (error) {
     update(deps, ref, "error", `Sync after clone failed: ${tail(errorMessage(error))}`);
     return;
