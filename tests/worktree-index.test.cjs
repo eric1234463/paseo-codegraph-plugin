@@ -154,6 +154,49 @@ test("ensureWorktreeIndex syncs an existing index without cloning", async () => 
   }
 });
 
+async function runSyncScenario(failures) {
+  const directory = await makeGitRepo();
+  try {
+    const { defaultRun } = require("../.test-build/server/worktree-index.js");
+    const syncCalls = [];
+    const run = async (command, args, options) => {
+      if (command === "git") return defaultRun(command, args, options);
+      if (args[0] === "sync") {
+        syncCalls.push(args);
+        if (syncCalls.length <= failures) {
+          const error = new Error(`Command failed: ${command} ${args.join(" ")}`);
+          error.stderr = "Failed to sync: Sync could not acquire the file lock";
+          throw error;
+        }
+        return { stdout: "", stderr: "" };
+      }
+      return { stdout: JSON.stringify({ initialized: true, fileCount: 42 }), stderr: "" };
+    };
+    await mkdir(join(directory, ".codegraph"), { recursive: true });
+    await writeFile(codegraphDbPath(directory), Buffer.alloc(2048));
+    const updates = [];
+    await ensureWorktreeIndex({ id: "main-ws", cwd: directory, name: null },
+      { run, codegraphBin: "codegraph", retryDelayMs: 0, onUpdate: (update) => updates.push(update) });
+    return { syncCalls, last: updates.at(-1) };
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+test("ensureWorktreeIndex retries sync when the file lock is held, without -q", async () => {
+  const { syncCalls, last } = await runSyncScenario(2);
+  assert.equal(last.state, "ready");
+  assert.equal(syncCalls.length, 3);
+  assert.ok(syncCalls.every((args) => !args.includes("-q")), `sync must not be quiet, got: ${JSON.stringify(syncCalls)}`);
+});
+
+test("ensureWorktreeIndex surfaces the sync stderr once retries are exhausted", async () => {
+  const { syncCalls, last } = await runSyncScenario(99);
+  assert.equal(syncCalls.length, 3);
+  assert.equal(last.state, "error");
+  assert.match(last.detail, /could not acquire the file lock/);
+});
+
 test("findCodegraphBin picks the first existing candidate", () => {
   assert.equal(findCodegraphBin(["/nope/cg", "/yes/cg"], (path) => path === "/yes/cg"), "/yes/cg");
   assert.equal(findCodegraphBin(["", "/nope/cg"], () => false), "codegraph");

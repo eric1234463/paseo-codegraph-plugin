@@ -215,6 +215,28 @@ export interface EnsureDeps {
   codegraphBin?: string;
   onUpdate: (update: StatusUpdate) => void;
   signal?: AbortSignal;
+  /** Wait between sync retries; defaults to SYNC_RETRY_DELAY_MS. Test seam. */
+  retryDelayMs?: number;
+}
+
+const SYNC_ATTEMPTS = 3;
+const SYNC_RETRY_DELAY_MS = 3_000;
+
+/**
+ * `codegraph sync` exits 1 when another writer (e.g. the worktree's MCP daemon
+ * doing its catch-up sync) holds codegraph.lock. That is transient, so retry.
+ * Not `-q`: quiet mode swallows the error text, leaving only "Command failed".
+ */
+async function syncWithRetry(runCg: RunFn, codegraph: string, cwd: string, delayMs: number): Promise<void> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await runCg(codegraph, ["sync", cwd], { timeoutMs: 30 * 60_000, maxBufferBytes: 10_000_000 });
+      return;
+    } catch (error) {
+      if (attempt >= SYNC_ATTEMPTS) throw error;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
 }
 
 function update(deps: EnsureDeps, ref: WorkspaceRef, state: WorktreeIndexState, detail: string | null, fileCount: number | null = null) {
@@ -229,6 +251,7 @@ function update(deps: EnsureDeps, ref: WorkspaceRef, state: WorktreeIndexState, 
 export async function ensureWorktreeIndex(ref: WorkspaceRef, deps: EnsureDeps): Promise<void> {
   const run = deps.run ?? defaultRun;
   const codegraph = deps.codegraphBin ?? resolveCodegraphBin();
+  const retryDelayMs = deps.retryDelayMs ?? SYNC_RETRY_DELAY_MS;
   const codegraphEnv = pathEnvWith(codegraph);
   const runCg: RunFn = (command, args, options) => run(command, args, { ...options, env: codegraphEnv });
   if (!isValidWorkspaceId(ref.id)) return;
@@ -263,7 +286,7 @@ export async function ensureWorktreeIndex(ref: WorkspaceRef, deps: EnsureDeps): 
     if (status?.initialized) {
       update(deps, ref, "syncing", "Verifying existing index…", status.fileCount ?? null);
       try {
-        await runCg(codegraph, ["sync", "-q", ref.cwd], { timeoutMs: 30 * 60_000, maxBufferBytes: 10_000_000 });
+        await syncWithRetry(runCg, codegraph, ref.cwd, retryDelayMs);
       } catch (error) {
         update(deps, ref, "error", `Sync failed: ${tail(errorMessage(error))}`);
         return;
@@ -311,7 +334,7 @@ export async function ensureWorktreeIndex(ref: WorkspaceRef, deps: EnsureDeps): 
 
   update(deps, ref, "syncing", "Syncing cloned index to this worktree…");
   try {
-    await runCg(codegraph, ["sync", "-q", ref.cwd], { timeoutMs: 30 * 60_000, maxBufferBytes: 10_000_000 });
+    await syncWithRetry(runCg, codegraph, ref.cwd, retryDelayMs);
   } catch (error) {
     update(deps, ref, "error", `Sync after clone failed: ${tail(errorMessage(error))}`);
     return;
