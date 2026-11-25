@@ -7,5 +7,5 @@
     "noEmit": false,
     "outDir": ".test-build"
   },
-  "include": ["shared/**/*.ts", "server/**/*.ts"]
+  "include": ["index.server.ts", "shared/**/*.ts", "server/**/*.ts"]
 }

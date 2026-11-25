@@ -1,79 +1,85 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import { delimiter, dirname, join } from "node:path";
+import { spawn } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
-import { mkdir, realpath, rename, rm, stat } from "node:fs/promises";
-import { constants as fsConstants } from "node:fs";
-import { access } from "node:fs/promises";
-import type { WorktreeIndexState } from "../shared/worktree-index";
+import { stat } from "node:fs/promises";
+import { delimiter, dirname, join } from "node:path";
+import { performance } from "node:perf_hooks";
 
-const runFile = promisify(execFile);
+export const CREATE_INDEX_TIMEOUT_MS = 25_000;
 
-export interface RunResult {
-  stdout: string;
-  stderr: string;
-}
+export type IndexResult =
+  | { state: "ready"; detail: null; fileCount: number | null }
+  | { state: "error"; detail: string; fileCount: null };
 
-export type RunFn = (
-  command: string,
-  args: readonly string[],
-  options: { timeoutMs: number; maxBufferBytes: number; env?: NodeJS.ProcessEnv },
-) => Promise<RunResult>;
-
-export const defaultRun: RunFn = async (command, args, { timeoutMs, maxBufferBytes, env }) => {
-  const { stdout, stderr } = await runFile(command, [...args], {
-    timeout: timeoutMs,
-    maxBuffer: maxBufferBytes,
-    ...(env ? { env } : {}),
-  });
-  return { stdout: String(stdout), stderr: String(stderr) };
-};
-
-export interface WorkspaceRef {
-  id: string;
-  cwd: string;
-  name: string | null;
-}
-
-export interface StatusUpdate {
-  workspaceId: string;
-  cwd: string;
-  name: string | null;
-  state: WorktreeIndexState;
-  detail: string | null;
-  fileCount: number | null;
-}
-
-export interface CodegraphStatusJson {
+interface CodegraphStatusJson {
   initialized?: boolean;
   fileCount?: number;
   index?: { state?: string };
 }
 
-/** Parse `git worktree list --porcelain` into worktree root paths. Pure. */
-export function parseWorktreeList(output: string): string[] {
-  const paths: string[] = [];
-  for (const line of output.split("\n")) {
-    if (!line.startsWith("worktree ")) continue;
-    const path = line.slice("worktree ".length).trim();
-    if (path) paths.push(path);
-  }
-  return paths;
-}
+type RunFn = (
+  command: string,
+  args: string[],
+  options: { timeoutMs: number; env?: NodeJS.ProcessEnv; signal?: AbortSignal },
+) => Promise<string>;
 
-/** SQLite file magic: "SQLite format 3\0". Pure. */
-export function hasSqliteMagic(header: Uint8Array): boolean {
-  const magic = [0x53, 0x51, 0x4c, 0x69, 0x74, 0x65, 0x20, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x20, 0x33, 0x00];
-  if (header.length < magic.length) return false;
-  return magic.every((byte, i) => header[i] === byte);
-}
+export const defaultRun: RunFn = (command, args, { timeoutMs, env, signal }) => {
+  if (signal?.aborted) return Promise.reject(new Error("Indexing cancelled."));
+  return new Promise((resolve, reject) => {
+    // CodeGraph runs indexing in a child worker. Stop both processes on timeout.
+    const processGroup = process.platform !== "win32";
+    const child = spawn(command, args, {
+      detached: processGroup,
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    let stdout = "";
+    let stderr = "";
+    let failure: Error | undefined;
+    const stop = (error: Error) => {
+      failure ??= error;
+      if (!child.pid) return;
+      if (!processGroup) {
+        child.kill("SIGKILL");
+        return;
+      }
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") child.kill("SIGKILL");
+      }
+    };
+    const abort = () => stop(new Error("Indexing cancelled."));
+    const timer = setTimeout(() => stop(new Error("CodeGraph command timed out.")), timeoutMs);
+    child.stdout.setEncoding("utf8").on("data", (data: string) => {
+      stdout = (stdout + data).slice(-1_000_000);
+    });
+    child.stderr.setEncoding("utf8").on("data", (data: string) => {
+      stderr = (stderr + data).slice(-500);
+    });
+    signal?.addEventListener("abort", abort, { once: true });
+    child.on("error", (error) => { failure ??= error; });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      if (failure) reject(failure);
+      else if (code === 0) resolve(stdout);
+      else reject(new Error(stderr.trim() || stdout.trim().slice(-500) || `CodeGraph exited with code ${code}.`));
+    });
+  });
+};
 
 export function codegraphDbPath(root: string): string {
   return join(root, ".codegraph", "codegraph.db");
 }
 
-export function isValidWorkspaceId(id: string): boolean {
-  return /^[a-zA-Z0-9_-][a-zA-Z0-9_.-]{0,199}$/.test(id);
+export async function hasLocalIndex(root: string): Promise<boolean> {
+  try {
+    return (await stat(codegraphDbPath(root))).isFile();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 let cachedCodegraphBin: string | null = null;
@@ -138,217 +144,39 @@ export function _resetCodegraphBinCache(): void {
   cachedCodegraphBin = null;
 }
 
-function tail(text: string, maxChars = 500): string {
-  const trimmed = text.trim();
-  return trimmed.length <= maxChars ? trimmed : `…${trimmed.slice(-maxChars)}`;
-}
-
-async function exists(path: string): Promise<boolean> {
+export async function ensureWorktreeIndex(
+  cwd: string,
+  options: { timeoutMs: number; signal?: AbortSignal; run?: RunFn; codegraphBin?: string },
+): Promise<IndexResult> {
+  const deadline = performance.now() + options.timeoutMs;
   try {
-    await access(path, fsConstants.F_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
+    const run = options.run ?? defaultRun;
+    const binary = options.codegraphBin ?? resolveCodegraphBin();
+    const env = pathEnvWith(binary);
+    const execute = (args: string[]) => {
+      const timeoutMs = deadline - performance.now();
+      if (timeoutMs <= 0) throw new Error("CodeGraph command timed out.");
+      return run(binary, [...args, cwd], { timeoutMs, env, signal: options.signal });
+    };
+    const status = async (): Promise<CodegraphStatusJson> =>
+      JSON.parse(await execute(["status", "--json"])) as CodegraphStatusJson;
 
-async function dbSizeBytes(path: string): Promise<number | null> {
-  try {
-    const info = await stat(path);
-    return info.isFile() ? info.size : null;
-  } catch {
-    return null;
-  }
-}
-
-export interface WorktreeLayout {
-  /** Main checkout root (first entry of `git worktree list`). */
-  mainRoot: string;
-  /** True when cwd is a linked worktree rather than the main checkout. */
-  isLinked: boolean;
-}
-
-/** Resolve the main checkout for a workspace cwd. Null when cwd is not a git checkout. */
-export async function resolveWorktreeLayout(cwd: string, run: RunFn = defaultRun): Promise<WorktreeLayout | null> {
-  let output: string;
-  try {
-    ({ stdout: output } = await run("git", ["-C", cwd, "worktree", "list", "--porcelain"],
-      { timeoutMs: 30_000, maxBufferBytes: 1_000_000 }));
-  } catch {
-    return null;
-  }
-  const paths = parseWorktreeList(output);
-  if (!paths.length) return null;
-  // Canonicalize: macOS temp dirs (e.g. /var -> /private/var) would otherwise
-  // make the main checkout look like a linked worktree.
-  const [realCwd, mainRoot] = await Promise.all([
-    realpath(cwd).catch(() => cwd),
-    realpath(paths[0]).catch(() => paths[0]),
-  ]);
-  return { mainRoot, isLinked: realCwd !== mainRoot };
-}
-
-/**
- * Hot-copy a live SQLite db into place: VACUUM INTO writes a clean,
- * fully-checkpointed snapshot, so the source daemon's WAL never leaks in.
- * Never copies daemon sockets/pids. Atomic via temp file + rename.
- */
-export async function cloneIndex(sourceDb: string, destDb: string, run: RunFn = defaultRun): Promise<void> {
-  await mkdir(join(destDb, ".."), { recursive: true });
-  const tmpDb = `${destDb}.clone-tmp`;
-  await rm(tmpDb, { force: true });
-  await run("sqlite3", [sourceDb, `VACUUM INTO '${tmpDb.replace(/'/g, "''")}'`],
-    { timeoutMs: 15 * 60_000, maxBufferBytes: 1_000_000 });
-  const size = await dbSizeBytes(tmpDb);
-  if (size === null || size < 1024) {
-    await rm(tmpDb, { force: true });
-    throw new Error("Clone produced an empty database file.");
-  }
-  await rename(tmpDb, destDb);
-  // Drop stale lock/daemon artifacts; the worktree starts its own daemon on next command.
-  await Promise.all(["-shm", "-wal"].map((suffix) => rm(`${destDb}${suffix}`, { force: true })));
-}
-
-export interface EnsureDeps {
-  run?: RunFn;
-  /** Absolute codegraph binary; defaults to resolveCodegraphBin(). Test seam. */
-  codegraphBin?: string;
-  onUpdate: (update: StatusUpdate) => void;
-  signal?: AbortSignal;
-  /** Wait between sync retries; defaults to SYNC_RETRY_DELAY_MS. Test seam. */
-  retryDelayMs?: number;
-}
-
-const SYNC_ATTEMPTS = 3;
-const SYNC_RETRY_DELAY_MS = 3_000;
-
-/**
- * `codegraph sync` exits 1 when another writer (e.g. the worktree's MCP daemon
- * doing its catch-up sync) holds codegraph.lock. That is transient, so retry.
- * Not `-q`: quiet mode swallows the error text, leaving only "Command failed".
- */
-async function syncWithRetry(runCg: RunFn, codegraph: string, cwd: string, delayMs: number): Promise<void> {
-  for (let attempt = 1; ; attempt++) {
-    try {
-      await runCg(codegraph, ["sync", cwd], { timeoutMs: 30 * 60_000, maxBufferBytes: 10_000_000 });
-      return;
-    } catch (error) {
-      if (attempt >= SYNC_ATTEMPTS) throw error;
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    const existing = await hasLocalIndex(cwd) ? await status() : null;
+    if (existing?.initialized && existing.index?.state === "complete") {
+      return { state: "ready", detail: null, fileCount: existing.fileCount ?? null };
     }
-  }
-}
 
-function update(deps: EnsureDeps, ref: WorkspaceRef, state: WorktreeIndexState, detail: string | null, fileCount: number | null = null) {
-  deps.onUpdate({ workspaceId: ref.id, cwd: ref.cwd, name: ref.name, state, detail, fileCount });
-}
-
-/**
- * Bring a workspace's CodeGraph index to ready:
- * missing/corrupt db -> clone from main checkout (VACUUM INTO) + `codegraph sync`,
- * no source db -> full `codegraph index`, existing db -> `codegraph sync` repair.
- */
-export async function ensureWorktreeIndex(ref: WorkspaceRef, deps: EnsureDeps): Promise<void> {
-  const run = deps.run ?? defaultRun;
-  const codegraph = deps.codegraphBin ?? resolveCodegraphBin();
-  const retryDelayMs = deps.retryDelayMs ?? SYNC_RETRY_DELAY_MS;
-  const codegraphEnv = pathEnvWith(codegraph);
-  const runCg: RunFn = (command, args, options) => run(command, args, { ...options, env: codegraphEnv });
-  if (!isValidWorkspaceId(ref.id)) return;
-  if (deps.signal?.aborted) return;
-  if (!(await exists(ref.cwd))) {
-    update(deps, ref, "error", "Workspace directory does not exist.");
-    return;
-  }
-
-  const layout = await resolveWorktreeLayout(ref.cwd, run);
-  if (!layout) {
-    update(deps, ref, "skipped", "Not a git checkout; nothing to clone from.");
-    return;
-  }
-
-  const destDb = codegraphDbPath(ref.cwd);
-  const destSize = await dbSizeBytes(destDb);
-  const destPresent = destSize !== null && destSize >= 1024;
-
-  const checkStatus = async (cwd: string): Promise<CodegraphStatusJson | null> => {
-    try {
-      const { stdout } = await runCg(codegraph, ["status", "-j", cwd],
-        { timeoutMs: 60_000, maxBufferBytes: 1_000_000 });
-      return JSON.parse(stdout) as CodegraphStatusJson;
-    } catch {
-      return null;
+    await execute(existing?.initialized ? ["index"] : ["init", "--yes"]);
+    const after = await hasLocalIndex(cwd) ? await status() : null;
+    if (!after?.initialized || after.index?.state !== "complete") {
+      throw new Error("CodeGraph did not produce a complete local index.");
     }
-  };
-
-  if (destPresent) {
-    const status = await checkStatus(ref.cwd);
-    if (status?.initialized) {
-      update(deps, ref, "syncing", "Verifying existing index…", status.fileCount ?? null);
-      try {
-        await syncWithRetry(runCg, codegraph, ref.cwd, retryDelayMs);
-      } catch (error) {
-        update(deps, ref, "error", `Sync failed: ${tail(errorMessage(error))}`);
-        return;
-      }
-      const after = await checkStatus(ref.cwd);
-      update(deps, ref, "ready", null, after?.fileCount ?? status.fileCount ?? null);
-      return;
-    }
-    // Present but unreadable -> fall through to clone path.
-  }
-
-  const sourceDb = codegraphDbPath(layout.mainRoot);
-  const sourceSize = await dbSizeBytes(sourceDb);
-  if (sourceSize !== null && sourceSize >= 1024) {
-    update(deps, ref, "cloning", `Cloning index from ${layout.mainRoot}…`);
-    try {
-      await cloneIndex(sourceDb, destDb, run);
-    } catch (error) {
-      update(deps, ref, "error", `Clone failed: ${tail(errorMessage(error))}`);
-      return;
-    }
-  } else if (layout.isLinked) {
-    update(deps, ref, "indexing", "Source checkout has no index; building from scratch…");
-    try {
-      await runCg(codegraph, ["init", "-y", ref.cwd], { timeoutMs: 30 * 60_000, maxBufferBytes: 10_000_000 });
-    } catch (error) {
-      update(deps, ref, "error", `Init failed: ${tail(errorMessage(error))}`);
-      return;
-    }
-    const after = await checkStatus(ref.cwd);
-    update(deps, ref, "ready", null, after?.fileCount ?? null);
-    return;
-  } else {
-    update(deps, ref, "indexing", "No source index; building from scratch…");
-    try {
-      await runCg(codegraph, ["init", "-y", ref.cwd], { timeoutMs: 30 * 60_000, maxBufferBytes: 10_000_000 });
-    } catch (error) {
-      update(deps, ref, "error", `Init failed: ${tail(errorMessage(error))}`);
-      return;
-    }
-    const after = await checkStatus(ref.cwd);
-    update(deps, ref, "ready", null, after?.fileCount ?? null);
-    return;
-  }
-
-  update(deps, ref, "syncing", "Syncing cloned index to this worktree…");
-  try {
-    await syncWithRetry(runCg, codegraph, ref.cwd, retryDelayMs);
+    return { state: "ready", detail: null, fileCount: after.fileCount ?? null };
   } catch (error) {
-    update(deps, ref, "error", `Sync after clone failed: ${tail(errorMessage(error))}`);
-    return;
+    return {
+      state: "error",
+      detail: error instanceof Error ? error.message : String(error),
+      fileCount: null,
+    };
   }
-  const after = await checkStatus(ref.cwd);
-  update(deps, ref, "ready", null, after?.fileCount ?? null);
-}
-
-export function errorMessage(error: unknown): string {
-  if (error instanceof Error) {
-    const output = [error.message];
-    const stderr = (error as { stderr?: unknown }).stderr;
-    if (typeof stderr === "string" && stderr.trim()) output.push(stderr.trim());
-    return output.join(" ");
-  }
-  return String(error);
 }

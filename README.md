@@ -1,44 +1,19 @@
 # paseo-codegraph-worktree
 
-Paseo plugin (pinned to Paseo **0.10.0** SDK) that keeps CodeGraph working inside
-git worktrees.
+Paseo plugin that initializes a local CodeGraph index before the first agent starts in a new worktree. Requires Paseo 0.17.4 or later and CodeGraph on the daemon host.
 
-## Problem
+The plugin uses `worktree.create.after`. A local index in the source checkout enables indexing for new worktrees. A new worktree gets one `codegraph init --yes` run unless it already has a complete local index. CodeGraph MCP handles subsequent changes.
 
-`.codegraph/*` is gitignored, so `git worktree add` produces a worktree whose
-`.codegraph/` holds only `.gitignore` — no index. Agents in that worktree get no
-(or stale) code intelligence until someone runs a slow full `codegraph index`.
+The worktree can open if indexing fails or exceeds the 25-second command budget. The **Worktree index** sidebar shows the result and offers **Retry** on errors. Paseo skips the creation hook when restoring a missing worktree. From a restored worktree without an index, run `codegraph init --yes .`.
 
-## What it does
-
-On `workspace.created`, the server hook brings the workspace index to `ready`:
-
-1. **Missing/corrupt db** → hot-clone `codegraph.db` from the main checkout
-   (`sqlite3 … "VACUUM INTO …"`, atomic temp-file + rename, never copies daemon
-   sockets/pids), then `codegraph sync` to reconcile the worktree's HEAD.
-   File paths in the db are relative, so the clone is valid across worktrees.
-2. **No source db** → full `codegraph index` in the worktree.
-3. **Existing index** → `codegraph sync` verify + repair only, never overwritten.
-
-The server resolves the `codegraph` binary to an absolute path (newest nvm
-version first, then `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`;
-`CODEGRAPH_BIN` overrides everything), because Paseo is Finder-launched with
-a minimal `PATH` where a bare `codegraph` fails with ENOENT.
-
-The sidebar surface ("Worktree index", Database icon) lists per-workspace state
-(`pending → cloning → syncing → ready`, or `indexing` / `error` / `skipped`),
-file counts, and a Retry button. It polls `worktree-index.list` every 5s.
+Set `CODEGRAPH_BIN` on the daemon to select a specific executable. Otherwise the plugin checks the installed nvm Node versions and common binary locations before falling back to `PATH`.
 
 ## Develop
 
 ```sh
-npm install
+npm ci
 npm run typecheck
 npm test
 ```
 
-Install into Paseo from this directory:
-
-```sh
-paseo plugin install /Users/eric/personal-project/paseo-codegraph-plugin
-```
+Install the local plugin source with `paseo plugin install /absolute/path/to/paseo-codegraph-plugin`.

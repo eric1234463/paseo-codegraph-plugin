@@ -1,7 +1,7 @@
 {
   "id": "paseo-codegraph-worktree",
-  "description": "Clone the CodeGraph index into new worktrees and keep it indexed, with per-workspace status.",
+  "description": "Initialize a local CodeGraph index before the first agent starts in a new worktree.",
   "requirements": {
-    "paseo": ">=0.10.0"
+    "paseo": ">=0.17.4"
   }
 }

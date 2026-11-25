@@ -3,25 +3,17 @@ import type { RpcOutput } from "@getpaseo/plugin";
 import { z } from "zod";
 
 export const worktreeIndexState = z.enum([
-  "pending",
-  "cloning",
-  "syncing",
   "indexing",
   "ready",
   "error",
-  "skipped",
 ]);
 export type WorktreeIndexState = z.infer<typeof worktreeIndexState>;
 
 export function stateLabel(state: WorktreeIndexState): string {
   switch (state) {
-    case "pending": return "Pending";
-    case "cloning": return "Cloning index…";
-    case "syncing": return "Syncing…";
     case "indexing": return "Indexing…";
     case "ready": return "Ready";
     case "error": return "Error";
-    case "skipped": return "Skipped";
     default: return state satisfies never;
   }
 }
